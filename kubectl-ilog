@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+log_duration=30m
+kind=deployment
+
+dependencies="stern kubectl jq fzf awk"
+
+display_help() {
+  basename "$0"
+  echo
+  echo "Print container logs of selected deployment or replicaset."
+  echo
+  echo "Usage: " 
+  echo " $(basename "$0")"
+  echo " $(basename "$0") -h"
+  echo " $(basename "$0") -r"
+  echo " $(basename "$0") -s 15m"
+  echo " $(basename "$0") -r -s 15m"
+  echo
+  echo "Options:"
+  echo "  -s duration       Return logs newer than a relative duration like 5s, 2m, or 3h. Default: $log_duration"
+  echo "  -r kind           Use replicasets to select resource. Default: $kind"
+  echo "  -h help           Prints this help"
+  echo
+  echo "Dependencies:"
+  echo
+  echo " - stern: https://github.com/stern/stern"
+  echo " - kubectl: https://kubernetes.io/docs/tasks/tools/install-kubectl/"
+  echo " - jq: https://stedolan.github.io/jq/download/"
+  echo " - fzf: https://github.com/junegunn/fzf"
+  echo " - awk"
+
+  exit 0
+}
+
+check_dependencies() {
+  for s in $dependencies; do
+    if ! command -v "$s" &> /dev/null; then
+      echo "$s is not found and required to run this script."
+      exit 1
+    fi
+  done
+}
+
+get_pod_selector() {
+  local resource_name
+  resource_name=$(echo "$1" | awk '{print $1}')
+  local pod_selector
+  pod_selector=$(kubectl get "$kind" -o wide "$resource_name" --no-headers | \
+    awk '{print $(NF)}')
+  echo "$pod_selector"
+}
+
+while getopts ":s:rh" o; do
+  case "${o}" in
+    s)
+      log_duration=${OPTARG}
+      ;;
+    r)
+      kind=replicasets
+      ;;
+    *)
+      display_help
+      ;;
+  esac
+done
+shift $((OPTIND-1))
+
+check_dependencies
+
+context=$(kubectl config current-context)
+namespace=$(kubectl config view --minify --output 'jsonpath={..namespace}')
+
+selected_resource=$(kubectl get $kind | \
+  awk '{if ( $2!="0/0" && $2>0 ) print $0}' | \
+  fzf --bind 'ctrl-r:reload(kubectl get '"$kind"' | awk '"'"'{if ( $2!="0/0" && $2>0 ) print $0}'"'"')' \
+    +m --border \
+    --header="CONTEXT: $context | NAMESPACE: $namespace | (ctrl-r: reload)" \
+    --header-lines=1 \
+    --prompt $kind'> '\
+  )
+
+result=$?
+if [ $result -eq 0 ]; then
+  pod_selector=$(get_pod_selector "$selected_resource")
+
+  containers_in_pod=$(kubectl get po -l="$pod_selector" -o json | \
+    jq -r '.items[0].spec.containers[].name')
+  container_count=$(echo $containers_in_pod | awk -F' ' '{print NF}')
+
+  if [ $container_count -gt 1 ]; then
+    container=$(kubectl get po -l="$pod_selector" -o json | \
+      jq -r '.items[0].spec.containers[].name' | \
+      fzf --bind 'ctrl-r:reload(kubectl get po -l='"$pod_selector"' -o json | \
+          jq -r '"'"'.items[0].spec.containers[].name'"'"')' \
+        --cycle --border -m --prompt 'container (you can select multiple)> ' \
+        --preview-window="70%" \
+        --preview="kubectl get po -l=$pod_selector")
+  else
+    container=$containers_in_pod
+  fi
+  
+  result=$?
+  if [ $result -eq 0 ]; then
+    container=${container// /|}
+    stern -l "$pod_selector" -c "$container" --since "$log_duration"
+  fi
+else
+  echo "bye"
+fi
+
